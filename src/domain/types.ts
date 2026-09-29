@@ -60,6 +60,8 @@ export interface Snapshot {
   /** 武装期间禁止另开试听。 */
   auditionLocked: boolean
   canSwitch: boolean
+  /** 仅在正向交叉淡化尚未由完成回调提交时，可撤销切换并保留主路。 */
+  canKeepPrimary: boolean
   canStop: boolean
   busy: boolean
 }
@@ -123,7 +125,7 @@ export interface AudioParamLike {
   value: number
   setValueAtTime(value: number, time: number): void
   linearRampToValueAtTime(value: number, time: number): void
-  /** 撤销已排定的自动参数（交叉淡化中候选夭折时恢复主路输出）。 */
+  /** 撤销指定时间之后尚未执行的自动化事件。 */
   cancelScheduledValues(time: number): void
 }
 

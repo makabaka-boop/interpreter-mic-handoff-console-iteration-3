@@ -485,7 +485,7 @@ describe('SwitchbenchEngine — 失败切换只保留主路单一可听输出', 
     expect(s.micActive).toBe(true)
   })
 
-  it('候选在 80ms 淡化窗口内夭折：撤销主路淡化斜坡，输出恢复为主路单路', async () => {
+  it('候选在 80ms 淡化窗口内夭折：撤销后续自动化，主路从当前增益平滑恢复单路输出', async () => {
     const { h, primary, primLine, backupLine } = await armedHarness()
     const p = h.engine.switchToBackup()
     await flush()
@@ -502,22 +502,23 @@ describe('SwitchbenchEngine — 失败切换只保留主路单一可听输出', 
       ),
     ).toBe(true)
 
-    // 淡化定时器触发前候选自然结束 → 失败回退武装态。
+    // 淡化起点候选自然结束：撤销后续正向斜坡，主路继续平滑钉回 1。
     candidate.tracks[0].endNaturally()
 
-    expect(h.snap().phase).toBe('armed')
+    expect(h.snap().phase).toBe('switching')
     expect(h.snap().activeWhich).toBe('primary')
-    expect(primGain.canceledAt.length).toBeGreaterThan(0) // 已撤销主路 → 0 斜坡
-    expect(h.gainOf(primLine).gain.value).toBe(1)
-    expect(h.gainOf(backupLine).gain.value).toBe(0) // 备监听不被重新打开
+    expect(primGain.canceledAt.length).toBeGreaterThan(0)
     expect(candidate.tracks[0].stopCount).toBe(1)
     expect(primary.tracks[0].readyState).toBe('live')
-    expect(h.clock.pendingTimerCount()).toBe(0) // 迟到淡化定时器已作废
-    expect(h.snap().micActive).toBe(true)
+    expect(h.clock.pendingTimerCount()).toBe(1)
 
-    // 迟到的淡化定时器即使被错误触发也不能改写（这里已无定时器可跑）。
     h.clock.runFades()
     expect(h.snap().phase).toBe('armed')
+    expect(h.snap().activeWhich).toBe('primary')
+    expect(h.gainOf(primLine).gain.value).toBe(1)
+    expect(h.gainOf(backupLine).gain.value).toBe(0) // 备监听不被重新打开
+    expect(h.clock.pendingTimerCount()).toBe(0)
+    expect(h.snap().micActive).toBe(true)
   })
 
   it('恢复被拒绝：候选流立即停止、不留图外活轨道，主路/备监听状态不变', async () => {
@@ -552,6 +553,209 @@ describe('SwitchbenchEngine — 失败切换只保留主路单一可听输出', 
     expect(h.gainOf(primLine).gain.value).toBe(1)
     expect(h.gainOf(backupLine).gain.value).toBe(0)
     expect(h.snap().micActive).toBe(true)
+  })
+})
+
+describe('SwitchbenchEngine — 淡化中保留主路', () => {
+  interface StartedFade {
+    h: ReturnType<typeof harness>
+    primary: FakeStream
+    backupMonitor: FakeStream
+    candidate: FakeStream
+    candidateLine: Line
+    generationAtStart: number
+  }
+
+  async function startForwardFade(): Promise<StartedFade> {
+    const h = harness()
+    await authorizeOk(h)
+    const primary = await auditionOk(h, 'primary', 'dev-primary')
+    const backupMonitor = await auditionOk(h, 'backup', 'dev-backup')
+    h.engine.arm()
+
+    const switchP = h.engine.switchToBackup()
+    await flush()
+    const candidate = h.media.grantNext('candidate') as FakeStream
+    await flush()
+    await flush()
+    await switchP
+    const generationAtStart = h.engine.getGeneration()
+
+    const internals = h.engine as unknown as {
+      candidate: { line: Line } | null
+    }
+    const candidateLine = internals.candidate?.line
+    if (!candidateLine) throw new Error('备用候选线路不存在')
+    return { h, primary, backupMonitor, candidate, candidateLine, generationAtStart }
+  }
+
+  it.each([
+    { point: '起点', elapsed: 0.0001 },
+    { point: '中点', elapsed: 0.04 },
+    { point: '临近终点', elapsed: 0.079 },
+  ])(
+    '$point可依据假时钟上的当前连续增益撤销，回退完成后才释放备用',
+    async ({ elapsed }) => {
+      const {
+        h,
+        primary,
+        backupMonitor,
+        candidate,
+        candidateLine,
+        generationAtStart,
+      } = await startForwardFade()
+      const ctx = h.host.ctx!
+      const primLine = h.lineOf('primary')
+      const backupLine = h.lineOf('backup')
+      const primGain = h.gainOf(primLine).gain
+      const candidateGain = h.gainOf(candidateLine).gain
+
+      ctx.advance(elapsed)
+      expect(h.snap().canKeepPrimary).toBe(true)
+      const now = ctx.currentTime
+      const expectedPrimary = 1 - elapsed / 0.08
+      const expectedBackup = elapsed / 0.08
+      expect(primGain.valueAtTime(now)).toBeCloseTo(expectedPrimary, 5)
+      expect(candidateGain.valueAtTime(now)).toBeCloseTo(expectedBackup, 5)
+
+      h.engine.keepPrimary()
+
+      // 撤销点以曲线上求出的当前值作为新斜坡起点，而不是读可能已是终值的 gain.value。
+      expect(primGain.valueAtTime(now)).toBeCloseTo(expectedPrimary, 5)
+      expect(candidateGain.valueAtTime(now)).toBeCloseTo(expectedBackup, 5)
+      const revertEnd = now + 0.08
+      expect(primGain.valueAtTime(revertEnd)).toBeCloseTo(1, 5)
+      expect(candidateGain.valueAtTime(revertEnd)).toBeCloseTo(0, 5)
+      expect(h.engine.getGeneration()).toBe(generationAtStart + 1)
+      expect(candidate.tracks[0].stopCount).toBe(0)
+      expect(primary.tracks[0].readyState).toBe('live')
+
+      ctx.advance(0.08)
+      h.clock.runFades()
+
+      const s = h.snap()
+      expect(s.phase).toBe('armed')
+      expect(s.activeWhich).toBe('primary')
+      expect(s.canSwitch).toBe(true)
+      expect(candidate.tracks[0].stopCount).toBe(1)
+      expect(primary.tracks[0].stopCount).toBe(0)
+      expect(h.gainOf(primLine).gain.value).toBe(1)
+      expect(h.gainOf(backupLine).gain.value).toBe(0)
+      expect(backupMonitor.tracks[0].readyState).toBe('live')
+      expect(h.clock.pendingTimerCount()).toBe(0)
+    },
+  )
+
+  it('正向切换已经完成后不能回退已释放的主路', async () => {
+    const { h, candidate, primary } = await startForwardFade()
+    h.host.ctx!.advance(0.08)
+    h.clock.runFades()
+
+    expect(h.snap().phase).toBe('live')
+    expect(h.snap().canKeepPrimary).toBe(false)
+    expect(primary.tracks[0].stopCount).toBe(1)
+
+    h.engine.keepPrimary()
+    h.clock.runFades()
+
+    expect(h.snap().phase).toBe('live')
+    expect(h.snap().activeWhich).toBe('backup')
+    expect(candidate.tracks[0].stopCount).toBe(0)
+  })
+
+  it('候选在正向淡化终点结束：迟到完成定时器不得提升已释放候选，主路被平滑拉回', async () => {
+    const { h, candidate, primary } = await startForwardFade()
+    const ctx = h.host.ctx!
+    ctx.advance(0.08)
+
+    ;(candidate.tracks[0] as FakeTrack).endNaturally()
+    expect(h.snap().phase).toBe('switching')
+    expect(candidate.tracks[0].stopCount).toBe(1)
+    expect(primary.tracks[0].readyState).toBe('live')
+
+    ctx.advance(0.08)
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('armed')
+    expect(h.snap().activeWhich).toBe('primary')
+    expect(h.snap().message).toContain('平滑回到主路')
+    expect(primary.tracks[0].stopCount).toBe(0)
+  })
+
+  it('回退中途停止：取消未执行回调，立即释放全部且旧回调不改写界面', async () => {
+    const { h, candidate, primary, candidateLine } = await startForwardFade()
+    const ctx = h.host.ctx!
+    ctx.advance(0.04)
+    h.engine.keepPrimary()
+    const candidateEventsAfterKeep = h.gainOf(candidateLine).gain.events.length
+
+    h.engine.stop()
+    expect(h.snap().phase).toBe('idle')
+    expect(h.snap().micActive).toBe(false)
+    expect(candidate.tracks[0].stopCount).toBe(1)
+    expect(primary.tracks[0].stopCount).toBe(1)
+
+    ctx.advance(0.04)
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('idle')
+    expect(h.snap().message).toContain('已停止')
+    expect(h.gainOf(candidateLine).gain.events.length).toBe(candidateEventsAfterKeep)
+  })
+
+  it('回退中途原主路结束：进入故障并释放候选，迟到完成回调不得改回武装态', async () => {
+    const { h, primary, candidate } = await startForwardFade()
+    const ctx = h.host.ctx!
+    ctx.advance(0.04)
+    h.engine.keepPrimary()
+    ;(primary.tracks[0] as FakeTrack).endNaturally()
+
+    expect(h.snap().phase).toBe('fault')
+    expect(candidate.tracks[0].stopCount).toBe(1)
+    expect(h.snap().micActive).toBe(false)
+
+    ctx.advance(0.04)
+    h.clock.runFades()
+    expect(h.snap().phase).toBe('fault')
+    expect(h.snap().activeWhich).toBeNull()
+  })
+
+  it('回退中途候选结束：主路继续平滑恢复，完成后仍只有主路有效', async () => {
+    const { h, primary, candidate, backupMonitor } = await startForwardFade()
+    const ctx = h.host.ctx!
+    const primLine = h.lineOf('primary')
+    ctx.advance(0.04)
+    h.engine.keepPrimary()
+    ;(candidate.tracks[0] as FakeTrack).endNaturally()
+
+    expect(h.snap().phase).toBe('switching')
+    expect(h.snap().activeWhich).toBe('primary')
+    ctx.advance(0.04)
+    h.clock.runFades()
+
+    expect(h.snap().phase).toBe('armed')
+    expect(h.gainOf(primLine).gain.value).toBe(1)
+    expect(candidate.tracks[0].stopCount).toBe(1)
+    expect(primary.tracks[0].readyState).toBe('live')
+    expect(backupMonitor.tracks[0].readyState).toBe('live')
+  })
+
+  it('连续撤销只有首个有效，后续调用不会重复安排或重复释放', async () => {
+    const { h, candidate } = await startForwardFade()
+    const ctx = h.host.ctx!
+    ctx.advance(0.04)
+    h.engine.keepPrimary()
+    const generationAfterFirst = h.engine.getGeneration()
+    const timerCountAfterFirst = h.clock.pendingTimerCount()
+
+    ctx.advance(0.01)
+    h.engine.keepPrimary()
+
+    expect(h.engine.getGeneration()).toBe(generationAfterFirst)
+    expect(h.clock.pendingTimerCount()).toBe(timerCountAfterFirst)
+    expect(candidate.tracks[0].stopCount).toBe(0)
+
+    ctx.advance(0.03)
+    h.clock.runFades()
+    expect(candidate.tracks[0].stopCount).toBe(1)
   })
 })
 

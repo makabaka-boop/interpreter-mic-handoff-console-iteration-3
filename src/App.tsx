@@ -112,6 +112,16 @@ export default function App() {
           </button>
           <button
             type="button"
+            className="btn"
+            disabled={!s.canKeepPrimary}
+            onClick={() => engine.keepPrimary()}
+            title={s.canKeepPrimary ? '' : '仅在交叉淡化完成前可撤销'}
+            data-testid="btn-keep-primary"
+          >
+            撤销切换 / 保留主路
+          </button>
+          <button
+            type="button"
             className="btn btn-danger"
             disabled={!s.canStop}
             onClick={() => engine.stop()}
@@ -124,6 +134,7 @@ export default function App() {
         <ul className="rules" data-testid="rules">
           <li>武装期间禁止另开试听；备用就绪前主路持续输出。</li>
           <li>候选就绪后以 80ms 线性增减益交叉，完成后才停止旧主轨道。</li>
+          <li>淡化未完成时可撤销：从当前增益平滑回到主路，完成后才释放备用设备。</li>
           <li>候选拒绝 / 提前结束 / 音频上下文恢复失败：保留原主路。</li>
           <li>活动主路结束即进入故障态，须重新试听主、备后方可再次武装。</li>
           <li>停止会断开全部节点并关闭音频上下文，不残留麦克风占用。</li>

@@ -61,6 +61,27 @@ const emptyChannel = (): ChannelRuntime => ({
   level: 0,
 })
 
+type FadeKind = 'switch' | 'revert' | 'recover'
+
+interface GainRamp {
+  from: number
+  to: number
+  start: number
+  end: number
+}
+
+interface FadeSession {
+  gen: number
+  kind: FadeKind
+  timer: number
+  primary: InternalLine
+  candidate: InternalLine | null
+  oldMonitor: InternalLine | null
+  /** 本次会话正在执行的两段线性增益曲线；用当前时钟求连续值，不能读终值跳变。 */
+  primaryRamp: GainRamp
+  backupRamp: GainRamp
+}
+
 const LABEL: Record<Which, string> = { primary: '主路', backup: '备路' }
 
 /**
@@ -84,8 +105,8 @@ export class SwitchbenchEngine {
   /** 当前活动（正在对外输出）的线路归属。 */
   private activeWhich: Which | null = null
   /** 切换过程中的备用候选；就绪、淡化、提升都围绕它。 */
-  private candidate: { gen: number; line: InternalLine } | null = null
-  private fadeTimer: number | null = null
+  private candidate: { line: InternalLine } | null = null
+  private fade: FadeSession | null = null
   /**
    * 已从 getUserMedia 取到、但尚未建成线路（或尚未被代次否决）的在途流。
    * 它们真实占用着麦克风，必须计入 micActive；建线时转交线路、放弃时立即停止。
@@ -399,44 +420,18 @@ export class SwitchbenchEngine {
       const candidate = this.buildLine('backup', stream, { startGain: 0 })
       // 流已由候选线路接管，不再计入“在途”。
       stream = null
-      this.candidate = { gen, line: candidate }
       const oldMonitor = backup.line
+      this.candidate = { line: candidate }
       if (oldMonitor && oldMonitor !== candidate) this.stopMeter(oldMonitor)
 
       this.message = '备用候选就绪，开始 80ms 线性交叉淡化…'
       this.publish()
 
-      const primLine = primary.line
-      const t0 = ctx.currentTime
-      candidate.gain.gain.setValueAtTime(0, t0)
-      candidate.gain.gain.linearRampToValueAtTime(1, t0 + CROSSFADE_MS / 1000)
-      if (primLine) {
-        primLine.gain.gain.setValueAtTime(1, t0)
-        primLine.gain.gain.linearRampToValueAtTime(0, t0 + CROSSFADE_MS / 1000)
+      if (!primary.line) {
+        throw new ResumeError('原主路在交叉淡化前已释放')
       }
-
-      this.fadeTimer = this.scheduler.delay(CROSSFADE_MS, () => {
-        this.fadeTimer = null
-        if (gen !== this.generation || this.candidate?.line !== candidate) {
-          // 交叉期间已故障 / 被停止：迟到候选立即释放。
-          if (!candidate.released) this.releaseLine(candidate)
-          if (this.candidate?.line === candidate) this.candidate = null
-          return
-        }
-        // 淡化完成：先提升候选为活动主路，再停止旧轨道、断开旧节点。
-        backup.line = candidate
-        this.activeWhich = 'backup'
-        this.candidate = null
-        if (oldMonitor && oldMonitor !== candidate) this.releaseLine(oldMonitor)
-        if (primLine) {
-          this.releaseLine(primLine)
-          if (primary.line === primLine) primary.line = null
-        }
-        primary.auditioned = false
-        this.phase = 'live'
-        this.message = '已切换到备用线路持续输出，旧主路轨道与节点已释放。'
-        this.publish()
-      })
+      this.startForwardFade(gen, primary.line, candidate, oldMonitor, ctx.currentTime)
+      this.publish()
     } catch (error) {
       if (stream && gen !== this.generation) {
         this.discardStream(stream)
@@ -454,23 +449,50 @@ export class SwitchbenchEngine {
   }
 
   /**
-   * 候选拒绝 / 提前结束 / 恢复失败：释放候选，回到武装态，主路不动。
+   * 撤销尚未完成的正向切换，保留主路。只能在正向淡化尚未提交时调用：
+   * 完成回调已经释放旧主路后，不能再把它当作可回退资源。
+   */
+  keepPrimary(): void {
+    if (!this.supported) return
+    const fade = this.fade
+    const ctx = this.ctx
+    if (!fade || fade.kind !== 'switch' || !ctx || ctx.state === 'closed') return
+
+    const now = ctx.currentTime
+    if (now >= fade.primaryRamp.end) return
+
+    const primaryGain = this.currentRampGain(fade.primaryRamp, now)
+    const backupGain = this.currentRampGain(fade.backupRamp, now)
+    const end = now + CROSSFADE_MS / 1000
+    this.generation++
+    this.cancelFadeTimer(fade)
+    fade.gen = this.generation
+    fade.kind = 'revert'
+    fade.primaryRamp = { from: primaryGain, to: 1, start: now, end }
+    fade.backupRamp = { from: backupGain, to: 0, start: now, end }
+    this.scheduleRamp(fade.primary, fade.primaryRamp)
+    if (fade.candidate) this.scheduleRamp(fade.candidate, fade.backupRamp)
+    fade.timer = this.scheduleFadeEnd(fade, end)
+    this.phase = 'switching'
+    this.message = '正在撤销切换：从当前增益平滑回到主路，备用设备将在回退完成后释放。'
+    this.publish()
+  }
+
+  /**
+   * 候选拒绝 / 提前结束但淡化尚未开始 / 恢复失败：释放候选，回到武装态，主路不动。
    * 关键不变量：
-   *  - 只保留主路一路可听输出：主路增益必须恢复为 1（撤销可能已排定的淡化斜坡）；
+   *  - 只保留主路一路可听输出：主路增益必须恢复为 1；
    *  - 备路监听继续静默（保持武装时的 0 增益），绝不与主路同时送进耳返。
    */
   private abortSwitchRetainingPrimary(reason: string): void {
-    if (this.fadeTimer !== null) {
-      this.scheduler.cancelDelay(this.fadeTimer)
-      this.fadeTimer = null
-    }
+    this.cancelActiveFade()
     if (this.candidate) {
       this.releaseLine(this.candidate.line)
       this.candidate = null
     }
     const primLine = this.channels.primary.line
     if (primLine && this.ctx && this.ctx.state !== 'closed') {
-      // 候选可能在 80ms 淡化窗口内夭折：撤销主路 -> 0 的排定斜坡并钉回 1。
+      // 无已开始的淡化时，这里只需要取消迟到自动化并钉回 1。
       try {
         primLine.gain.gain.cancelScheduledValues(this.ctx.currentTime)
       } catch {
@@ -479,17 +501,154 @@ export class SwitchbenchEngine {
       primLine.gain.gain.value = 1
       primLine.muted = false
     }
-    const backupMon = this.channels.backup.line
-    if (backupMon) {
+    this.restoreBackupMonitorAfterFade()
+    this.phase = 'armed'
+    this.activeWhich = 'primary'
+    this.fade = null
+    this.message = reason
+    this.publish()
+  }
+
+  private startForwardFade(
+    gen: number,
+    primary: InternalLine,
+    candidate: InternalLine,
+    oldMonitor: InternalLine | null,
+    startTime: number,
+  ): void {
+    const end = startTime + CROSSFADE_MS / 1000
+    const fade: FadeSession = {
+      gen,
+      kind: 'switch',
+      timer: 0,
+      primary,
+      candidate,
+      oldMonitor,
+      primaryRamp: { from: 1, to: 0, start: startTime, end },
+      backupRamp: { from: 0, to: 1, start: startTime, end },
+    }
+    this.scheduleRamp(primary, fade.primaryRamp)
+    this.scheduleRamp(candidate, fade.backupRamp)
+    fade.timer = this.scheduleFadeEnd(fade, end)
+    this.fade = fade
+  }
+
+  private scheduleFadeEnd(fade: FadeSession, endTime: number): number {
+    const gen = fade.gen
+    const delayMs = Math.max(0, Math.round((endTime - (this.ctx?.currentTime ?? endTime)) * 1000))
+    return this.scheduler.delay(delayMs, () => this.completeFade(fade, gen))
+  }
+
+  private scheduleRamp(line: InternalLine, ramp: GainRamp): void {
+    const param = line.gain.gain
+    param.cancelScheduledValues(ramp.start)
+    param.setValueAtTime(ramp.from, ramp.start)
+    param.linearRampToValueAtTime(ramp.to, ramp.end)
+  }
+
+  /** 依据已安排的线性曲线求值；绝不读取可能已经被自动化写成终值的 gain.value。 */
+  private currentRampGain(ramp: GainRamp, now: number): number {
+    if (now <= ramp.start) return ramp.from
+    if (now >= ramp.end) return ramp.to
+    const ratio = (now - ramp.start) / (ramp.end - ramp.start)
+    return ramp.from + (ramp.to - ramp.from) * ratio
+  }
+
+  private completeFade(fade: FadeSession, gen: number): void {
+    if (this.fade !== fade || gen !== this.generation) return
+
+    if (fade.kind === 'switch') {
+      const candidate = fade.candidate
+      if (!candidate) return
+      const backup = this.channels.backup
+      const primary = this.channels.primary
+      backup.line = candidate
+      this.activeWhich = 'backup'
+      this.candidate = null
+      this.fade = null
+      if (fade.oldMonitor && fade.oldMonitor !== candidate) {
+        this.releaseLine(fade.oldMonitor)
+      }
+      this.releaseLine(fade.primary)
+      if (primary.line === fade.primary) {
+        primary.line = null
+        primary.auditioned = false
+      }
+      this.phase = 'live'
+      this.message = '已切换到备用线路持续输出，旧主路轨道与节点已释放。'
+      this.publish()
+      return
+    }
+
+    const endedByCandidateLoss = fade.kind === 'recover'
+    if (fade.candidate) {
+      this.releaseLine(fade.candidate)
+      if (this.candidate?.line === fade.candidate) this.candidate = null
+    }
+    const primary = fade.primary
+    primary.muted = false
+    primary.gain.gain.value = 1
+    this.fade = null
+    this.restoreBackupMonitorAfterFade(fade.oldMonitor)
+    this.phase = 'armed'
+    this.activeWhich = 'primary'
+    this.message = endedByCandidateLoss
+      ? '备用候选提前结束，已从当前增益平滑回到主路；可重新发起切换。'
+      : '已撤销切换并保留主路；备用设备已在回退完成后释放。'
+    this.publish()
+  }
+
+  private beginPrimaryRecovery(): void {
+    const fade = this.fade
+    const ctx = this.ctx
+    if (!fade || !ctx || ctx.state === 'closed') return
+
+    const now = ctx.currentTime
+    const currentPrimary = this.currentRampGain(fade.primaryRamp, now)
+    const candidate = fade.candidate
+    if (candidate && !candidate.released) this.releaseLine(candidate)
+    if (this.candidate?.line === candidate) this.candidate = null
+
+    // 即使音频时钟已到终点，也不能提升已结束候选；用固定短淡化平滑拉回主路。
+    const duration = CROSSFADE_MS / 1000
+    this.generation++
+    this.cancelFadeTimer(fade)
+    const end = now + duration
+    fade.gen = this.generation
+    fade.kind = 'recover'
+    fade.candidate = null
+    fade.primaryRamp = { from: currentPrimary, to: 1, start: now, end }
+    fade.backupRamp = { from: 0, to: 0, start: now, end }
+    this.scheduleRamp(fade.primary, fade.primaryRamp)
+    fade.timer = this.scheduleFadeEnd(fade, end)
+    this.message = '备用候选提前结束，正在从当前增益平滑恢复主路输出。'
+    this.publish()
+  }
+
+  private handleFadeCandidateEnded(line: InternalLine): void {
+    this.releaseLine(line)
+    if (this.candidate?.line === line) this.candidate = null
+    this.beginPrimaryRecovery()
+  }
+
+  private restoreBackupMonitorAfterFade(preferred?: InternalLine | null): void {
+    const backupMon = preferred ?? this.channels.backup.line
+    if (backupMon && !backupMon.released) {
       // 备路监听维持武装时的静默（增益 0），只恢复其电平表轮询。
       backupMon.muted = true
       backupMon.gain.gain.value = 0
       this.startMeter(backupMon)
     }
-    this.phase = 'armed'
-    this.activeWhich = 'primary'
-    this.message = reason
-    this.publish()
+  }
+
+  private cancelActiveFade(): void {
+    if (!this.fade) return
+    this.cancelFadeTimer(this.fade)
+    this.fade = null
+  }
+
+  private cancelFadeTimer(fade: FadeSession): void {
+    this.scheduler.cancelDelay(fade.timer)
   }
 
   // ---------------------------------------------------------------- 停止
@@ -530,7 +689,11 @@ export class SwitchbenchEngine {
       return
     }
 
-    // 切换候选在提升前夭折：保留原主路。
+    // 切换候选在提升前夭折：淡化中从当前主路增益平滑恢复；未开始淡化则直接回到武装态。
+    if (this.fade?.candidate === line) {
+      this.handleFadeCandidateEnded(line)
+      return
+    }
     if (this.candidate?.line === line) {
       this.releaseLine(line)
       this.candidate = null
@@ -687,10 +850,7 @@ export class SwitchbenchEngine {
   }
 
   private releaseAll(): void {
-    if (this.fadeTimer !== null) {
-      this.scheduler.cancelDelay(this.fadeTimer)
-      this.fadeTimer = null
-    }
+    this.cancelActiveFade()
     // 已取到但尚未建成线路的在途流（如恢复失败窗口内停止）：一并停止，
     // 否则浏览器麦克风指示会在页面显示“已释放”后仍然亮着。
     for (const pending of this.inflightStreams) this.stopStream(pending)
@@ -894,6 +1054,11 @@ export class SwitchbenchEngine {
       this.channels.primary.requesting ||
       this.channels.backup.requesting
     const canArm = this.canArmInternal()
+    const now = this.ctx?.currentTime ?? Infinity
+    const canKeepPrimary =
+      this.phase === 'switching' &&
+      this.fade?.kind === 'switch' &&
+      this.fade.primaryRamp.end > now
     return {
       phase: this.phase,
       generation: this.generation,
@@ -909,6 +1074,7 @@ export class SwitchbenchEngine {
       auditionLocked:
         this.phase === 'armed' || this.phase === 'switching' || this.phase === 'live',
       canSwitch: this.phase === 'armed' && !requesting,
+      canKeepPrimary,
       canStop:
         this.phase === 'audition' ||
         this.phase === 'armed' ||

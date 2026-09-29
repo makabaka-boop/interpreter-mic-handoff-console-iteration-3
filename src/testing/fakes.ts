@@ -178,9 +178,15 @@ export class FakeAudioNode implements AudioNodeLike {
   }
 }
 
+export interface FakeAutomationEvent {
+  value: number
+  at: number
+  method: 'setValueAtTime' | 'linearRampToValueAtTime'
+}
+
 export class FakeAudioParam {
   value = 1
-  events: Array<{ value: number; at: number; method: string }> = []
+  events: FakeAutomationEvent[] = []
   canceledAt: number[] = []
   setValueAtTime(value: number, at: number): void {
     this.value = value
@@ -191,6 +197,27 @@ export class FakeAudioParam {
   }
   cancelScheduledValues(at: number): void {
     this.canceledAt.push(at)
+    this.events = this.events.filter((event) => event.at <= at)
+  }
+
+  /** 按 Web Audio 事件顺序求假时钟上的连续参数值。 */
+  valueAtTime(at: number): number {
+    const events = [...this.events].sort((a, b) => a.at - b.at)
+    if (events.length === 0) return this.value
+    if (at < events[0].at) return this.value
+    const lastBefore = [...events].reverse().find((event) => event.at <= at)
+    if (!lastBefore) return this.value
+
+    const next = events.find((event) => event.at > at)
+    if (!next || next.method !== 'linearRampToValueAtTime') {
+      return lastBefore.value
+    }
+
+    // 斜坡的起点是终止事件之前的最近事件。
+    const duration = next.at - lastBefore.at
+    if (duration <= 0) return next.value
+    const ratio = Math.min(1, Math.max(0, (at - lastBefore.at) / duration))
+    return lastBefore.value + (next.value - lastBefore.value) * ratio
   }
 }
 
@@ -278,6 +305,12 @@ export class FakeAudioContext implements AudioContextLike {
   async close(): Promise<void> {
     this.closeCount++
     this.state = 'closed'
+  }
+
+  /** 推进假 AudioContext 时钟；不触发 JS 定时器，二者由测试分别控制。 */
+  advance(seconds: number): void {
+    if (this.state === 'closed') return
+    this.currentTime += seconds
   }
 
   createMediaStreamSource(): AudioNodeLike {
