@@ -2,8 +2,9 @@
  * 校验台领域模型。
  *
  * 关键不变量：
- *  - 每次“试听 / 武装 / 切换 / 停止 / 故障”都递增 generation（代次）；
+ *  - 每次“试听 / 武装 / 切换 / 保留主路 / 停止 / 故障”都递增 generation（代次）；
  *    异步操作返回时仅当代次仍然匹配才可接管线路，否则其流必须立即停止。
+ *  - 交叉淡化未完成时可保留主路：按音频时钟和曲线求当前增益，再平滑反向淡化。
  *  - 候选拒绝、候选提前结束、AudioContext 恢复失败时，原主路继续输出。
  *  - 活动主路（武装后的主路、切换后的备路）一旦 ended 即进入 fault，
  *    必须重新试听主、备之后才允许再次武装。
@@ -60,6 +61,8 @@ export interface Snapshot {
   /** 武装期间禁止另开试听。 */
   auditionLocked: boolean
   canSwitch: boolean
+  /** 交叉淡化尚未完成时，操作员可撤销切换并保留原主路。 */
+  canKeepPrimary: boolean
   canStop: boolean
   busy: boolean
 }

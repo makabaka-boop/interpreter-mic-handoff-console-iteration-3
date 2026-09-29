@@ -17,10 +17,15 @@ import type { Scheduler } from '../domain/SwitchbenchEngine'
  * 设计要点：
  *  - 每条轨道的 ended 事件、readyState、stop() 都可在测试中直接操纵；
  *  - getUserMedia 支持 grant / reject / pending 三态与按 deviceId 拒绝；
- *  - 图节点记录 disconnect 次数，用来核对“节点断开、轨道释放”。
+ *  - 图节点记录 disconnect 次数，用来核对“节点断开、轨道释放”；
+ *  - AudioParam 依据假 AudioContext 时钟对 setValue/linearRamp 做线性求值。
  */
 
 type Listener = (event?: unknown) => void
+
+export interface FakeClockLike {
+  nowSeconds: number
+}
 
 export class FakeTrack implements MediaStreamTrackLike {
   kind = 'audio'
@@ -179,23 +184,61 @@ export class FakeAudioNode implements AudioNodeLike {
 }
 
 export class FakeAudioParam {
-  value = 1
+  private manualValue = 1
   events: Array<{ value: number; at: number; method: string }> = []
   canceledAt: number[] = []
+
+  constructor(private readonly clock: FakeClockLike = { nowSeconds: 10 }) {}
+
+  get value(): number {
+    if (this.events.length === 0) return this.manualValue
+    const events = [...this.events].sort((a, b) => a.at - b.at)
+    const now = this.clock.nowSeconds
+    const last = events[events.length - 1]
+    if (now >= last.at) return last.value
+
+    for (let i = 0; i < events.length - 1; i++) {
+      const current = events[i]
+      const next = events[i + 1]
+      if (now >= current.at && now < next.at) {
+        if (next.method !== 'linearRampToValueAtTime') return current.value
+        const ratio = (now - current.at) / (next.at - current.at)
+        return current.value + (next.value - current.value) * ratio
+      }
+    }
+    return events[0].value
+  }
+
+  set value(value: number) {
+    this.events = []
+    this.manualValue = value
+  }
+
+  activeEvents(): Array<{ value: number; at: number; method: string }> {
+    return [...this.events].sort((a, b) => a.at - b.at)
+  }
+
   setValueAtTime(value: number, at: number): void {
-    this.value = value
     this.events.push({ value, at, method: 'setValueAtTime' })
   }
+
   linearRampToValueAtTime(value: number, at: number): void {
     this.events.push({ value, at, method: 'linearRampToValueAtTime' })
   }
+
   cancelScheduledValues(at: number): void {
     this.canceledAt.push(at)
+    this.events = this.events.filter((event) => event.at < at)
   }
 }
 
 export class FakeGainNode extends FakeAudioNode implements GainNodeLike {
-  gain = new FakeAudioParam()
+  gain: FakeAudioParam
+
+  constructor(clock?: FakeClockLike) {
+    super()
+    this.gain = new FakeAudioParam(clock)
+  }
 }
 
 export class FakeAnalyserNode extends FakeAudioNode {
@@ -217,7 +260,9 @@ export class FakeAnalyserNode extends FakeAudioNode {
 }
 
 export class FakeAudioContext implements AudioContextLike {
-  currentTime = 10
+  get currentTime(): number {
+    return this.clock.nowSeconds
+  }
   state: 'suspended' | 'running' | 'closed' = 'suspended'
   destination = new FakeAudioNode()
   resumeShouldFail: string | null = null
@@ -236,6 +281,8 @@ export class FakeAudioContext implements AudioContextLike {
     resolve: () => void
     reject: (e: Error) => void
   }> = []
+
+  constructor(private readonly clock: FakeClockLike = { nowSeconds: 10 }) {}
 
   resume(): Promise<void> {
     this.resumeCalls++
@@ -287,7 +334,7 @@ export class FakeAudioContext implements AudioContextLike {
 
   createGain(): FakeGainNode {
     this.nodes.gain++
-    return new FakeGainNode()
+    return new FakeGainNode(this.clock)
   }
 
   createAnalyser(): FakeAnalyserNode {
@@ -307,7 +354,10 @@ export class FakeHost implements Host {
   /** 新创建上下文的可控恢复模式（见 FakeAudioContext.resumeMode）。 */
   resumeMode: 'reject' | 'nonrunning' | 'defer' | null = null
 
-  constructor(public media: FakeMediaDevices) {}
+  constructor(
+    public media: FakeMediaDevices,
+    private readonly clock: FakeClockLike = { nowSeconds: 10 },
+  ) {}
 
   mediaDevices(): FakeMediaDevices | null {
     return this.noMediaDevices ? null : this.media
@@ -330,7 +380,7 @@ export class FakeHost implements Host {
 
   private ensureCtx(): FakeAudioContext {
     if (!this.ctx || this.ctx.state === 'closed') {
-      this.ctx = new FakeAudioContext()
+      this.ctx = new FakeAudioContext(this.clock)
       this.ctx.resumeShouldFail = this.resumeShouldFail
       this.ctx.resumeMode = this.resumeMode
       this.createContextCount++
@@ -340,15 +390,20 @@ export class FakeHost implements Host {
 }
 
 /**
- * 可控调度器：raf/delay 只登记不自动执行，测试用 stepRaf/runFades 推进；
- * microtick 用真实微任务（await Promise.resolve 链）。
+ * 可控调度器：raf 只登记不自动执行；delay 记录到点时间，advance 只推进时钟，
+ * runFades 逐个推进到定时器到点并执行。microtick 用真实微任务。
  */
-export class ManualScheduler implements Scheduler {
+export class ManualScheduler implements Scheduler, FakeClockLike {
   private rafs = new Map<number, () => void>()
-  private timers = new Map<number, () => void>()
+  private timers = new Map<number, { atMs: number; cb: () => void }>()
   private nextId = 1
   rafCalls = 0
   delayCalls: Array<{ ms: number }> = []
+  private currentTimeMs = 10_000
+
+  get nowSeconds(): number {
+    return this.currentTimeMs / 1000
+  }
 
   raf(cb: () => void): number {
     this.rafCalls++
@@ -364,7 +419,7 @@ export class ManualScheduler implements Scheduler {
   delay(ms: number, cb: () => void): number {
     this.delayCalls.push({ ms })
     const id = this.nextId++
-    this.timers.set(id, cb)
+    this.timers.set(id, { atMs: this.currentTimeMs + ms, cb })
     return id
   }
 
@@ -384,10 +439,21 @@ export class ManualScheduler implements Scheduler {
     }
   }
 
+  advance(ms: number): void {
+    this.currentTimeMs += ms
+  }
+
   runFades(): void {
-    const pending = [...this.timers.entries()]
-    this.timers.clear()
-    pending.forEach(([, cb]) => cb())
+    while (this.timers.size > 0) {
+      const next = [...this.timers.values()].sort((a, b) => a.atMs - b.atMs)[0]
+      this.currentTimeMs = next.atMs
+      const due = [...this.timers.entries()]
+        .filter(([, timer]) => timer.atMs <= this.currentTimeMs)
+        .sort((a, b) => a[1].atMs - b[1].atMs)
+      for (const [id, timer] of due) {
+        if (this.timers.delete(id)) timer.cb()
+      }
+    }
   }
 
   pendingTimerCount(): number {
